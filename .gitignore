@@ -1,0 +1,10 @@
+venv
+.env
+app\__pycache__
+app\keyboards\__pycache__
+app\crypto\__pycache__
+app\db\__pycache__
+app\keyboards\__pycache__
+app\middlewares\__pycache__
+app\routers\__pycache__
+app\services\__pycache__
