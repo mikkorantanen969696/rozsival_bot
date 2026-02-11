@@ -1,6 +1,6 @@
 # Gionta Dice Bot
 
-Telegram bot for dice battles in group chats with paid matches, deposits/withdrawals via CryptoBot, admin panel, RU/ENG language switch, and referral analytics.
+Telegram bot for dice battles in group chats with paid matches, deposits/withdrawals via CryptoBot, admin panel, RU/ENG language switch, and referal analytics.
 
 ## Stack
 - Python 3.11
