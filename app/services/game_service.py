@@ -1,6 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
+from asyncio import CancelledError, Task
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -23,7 +24,7 @@ class DraftGame:
     opponent_username: str | None
     opponent_id: int | None = None
     game_type: GameType | None = None
-    bet: float | None = None
+    bet: Decimal | None = None
     rounds_to_win: int | None = None
 
     def is_ready(self) -> bool:
@@ -39,25 +40,39 @@ class GameService:
         self._session_factory = session_factory
         self._finance = finance
         self._config = config
-        self._drafts: dict[int, DraftGame] = {}
-        self._rematch_votes: dict[int, set[int]] = {}
         self._bot: Bot | None = None
+        self._timeout_task: Task | None = None
 
     def start_timeout_watcher(self, bot: Bot) -> None:
         self._bot = bot
-        asyncio.create_task(self._timeout_loop())
+        if self._timeout_task and not self._timeout_task.done():
+            return
+        self._timeout_task = asyncio.create_task(self._timeout_loop())
+
+    async def stop_timeout_watcher(self) -> None:
+        if not self._timeout_task:
+            return
+        self._timeout_task.cancel()
+        try:
+            await self._timeout_task
+        except CancelledError:
+            pass
+        self._timeout_task = None
 
     async def _timeout_loop(self) -> None:
-        while True:
-            await asyncio.sleep(TIMEOUT_CHECK_INTERVAL)
-            async with self._session_factory() as session:
-                games = await dao.get_active_games(session)
-                now = datetime.utcnow()
-                for game in games:
-                    if game.status != GameStatus.active or not game.turn_deadline:
-                        continue
-                    if now >= game.turn_deadline:
-                        await self._handle_timeout(session, game)
+        try:
+            while True:
+                await asyncio.sleep(TIMEOUT_CHECK_INTERVAL)
+                async with self._session_factory() as session:
+                    games = await dao.get_active_games(session)
+                    now = datetime.utcnow()
+                    for game in games:
+                        if game.status != GameStatus.active or not game.turn_deadline:
+                            continue
+                        if now >= game.turn_deadline:
+                            await self._handle_timeout(session, game)
+        except CancelledError:
+            return
 
     async def _handle_timeout(self, session: AsyncSession, game: Game) -> None:
         if not game.current_turn_user_id:
@@ -70,16 +85,41 @@ class GameService:
                 f"⏳ Turn timed out. Winner: <a href=\"tg://user?id={winner_id}\">Player</a> 🏆",
             )
 
-    def get_draft(self, user_id: int) -> DraftGame | None:
-        return self._drafts.get(user_id)
+    async def get_draft(self, session: AsyncSession, user_id: int) -> DraftGame | None:
+        draft = await dao.get_game_draft(session, user_id)
+        if draft is None:
+            return None
+        return DraftGame(
+            opponent_username=draft.opponent_username,
+            opponent_id=draft.opponent_id,
+            game_type=draft.game_type,
+            bet=draft.bet,
+            rounds_to_win=draft.rounds_to_win,
+        )
 
-    def create_draft(self, user_id: int, opponent_username: str | None, opponent_id: int | None) -> DraftGame:
-        draft = DraftGame(opponent_username=opponent_username, opponent_id=opponent_id)
-        self._drafts[user_id] = draft
-        return draft
+    async def create_draft(
+        self,
+        session: AsyncSession,
+        user_id: int,
+        opponent_username: str | None,
+        opponent_id: int | None,
+    ) -> DraftGame:
+        await dao.upsert_game_draft(session, user_id, opponent_username, opponent_id)
+        return DraftGame(opponent_username=opponent_username, opponent_id=opponent_id)
 
-    def clear_draft(self, user_id: int) -> None:
-        self._drafts.pop(user_id, None)
+    async def save_draft(self, session: AsyncSession, user_id: int, draft: DraftGame) -> None:
+        await dao.upsert_game_draft(
+            session=session,
+            user_id=user_id,
+            opponent_username=draft.opponent_username,
+            opponent_id=draft.opponent_id,
+            game_type=draft.game_type,
+            bet=draft.bet,
+            rounds_to_win=draft.rounds_to_win,
+        )
+
+    async def clear_draft(self, session: AsyncSession, user_id: int) -> None:
+        await dao.delete_game_draft(session, user_id)
 
     async def ensure_user(self, session: AsyncSession, user_id: int, username: str | None):
         return await self._finance.ensure_user(session, user_id, username)
@@ -96,7 +136,7 @@ class GameService:
         player2_id: int,
         draft: DraftGame,
     ) -> Game:
-        bet = draft.bet or 0
+        bet = draft.bet or Decimal("0")
         return await dao.create_game(
             session=session,
             chat_id=chat_id,
@@ -173,27 +213,26 @@ class GameService:
         await session.execute(update(User).where(User.id == winner_id).values(wins=User.wins + 1))
         await session.execute(update(User).where(User.id == loser_id).values(losses=User.losses + 1))
 
-        if game.type == GameType.paid and game.bet > 0:
-            bet_value = Decimal(str(game.bet))
-            prize = bet_value * Decimal("2")
-            commission_rate = Decimal(str(self._config.commission_percent)) / Decimal("100")
+        if game.type == GameType.paid and game.bet > Decimal("0"):
+            prize = game.bet * Decimal("2")
+            commission_rate = self._config.commission_percent / Decimal("100")
             commission = prize * commission_rate
             payout = prize - commission
             commission_per_player = commission / Decimal("2")
-            await session.execute(update(User).where(User.id == winner_id).values(balance=User.balance + float(payout)))
-            session.add(LedgerEntry(user_id=winner_id, amount=float(payout), reason="payout", game_id=game.id))
+            await session.execute(update(User).where(User.id == winner_id).values(balance=User.balance + payout))
+            session.add(LedgerEntry(user_id=winner_id, amount=payout, reason="payout", game_id=game.id))
             session.add(
                 CommissionEntry(
                     user_id=game.player1_id,
                     game_id=game.id,
-                    amount=float(commission_per_player),
+                    amount=commission_per_player,
                 )
             )
             session.add(
                 CommissionEntry(
                     user_id=game.player2_id,
                     game_id=game.id,
-                    amount=float(commission_per_player),
+                    amount=commission_per_player,
                 )
             )
             game.funds_locked = False
@@ -204,21 +243,21 @@ class GameService:
         game = await session.get(Game, game_id)
         if not game or game.status == GameStatus.finished:
             return
-        if game.type == GameType.paid and game.funds_locked and game.bet > 0:
+        if game.type == GameType.paid and game.funds_locked and game.bet > Decimal("0"):
             await session.execute(
-                update(User).where(User.id == game.player1_id).values(balance=User.balance + float(game.bet))
+                update(User).where(User.id == game.player1_id).values(balance=User.balance + game.bet)
             )
             await session.execute(
-                update(User).where(User.id == game.player2_id).values(balance=User.balance + float(game.bet))
+                update(User).where(User.id == game.player2_id).values(balance=User.balance + game.bet)
             )
-            session.add(LedgerEntry(user_id=game.player1_id, amount=float(game.bet), reason="refund", game_id=game.id))
-            session.add(LedgerEntry(user_id=game.player2_id, amount=float(game.bet), reason="refund", game_id=game.id))
+            session.add(LedgerEntry(user_id=game.player1_id, amount=game.bet, reason="refund", game_id=game.id))
+            session.add(LedgerEntry(user_id=game.player2_id, amount=game.bet, reason="refund", game_id=game.id))
             game.funds_locked = False
         game.status = GameStatus.cancelled
         await session.commit()
 
     async def rematch(self, session: AsyncSession, game: Game) -> Game:
-        new_game = await dao.create_game(
+        return await dao.create_game(
             session,
             chat_id=game.chat_id,
             player1_id=game.player1_id,
@@ -227,15 +266,12 @@ class GameService:
             bet=game.bet,
             rounds_to_win=game.rounds_to_win,
         )
-        return new_game
 
-    def add_rematch_vote(self, game_id: int, user_id: int) -> int:
-        votes = self._rematch_votes.setdefault(game_id, set())
-        votes.add(user_id)
-        return len(votes)
+    async def add_rematch_vote(self, session: AsyncSession, game_id: int, user_id: int) -> int:
+        return await dao.add_rematch_vote(session, game_id, user_id)
 
-    def clear_rematch_votes(self, game_id: int) -> None:
-        self._rematch_votes.pop(game_id, None)
+    async def clear_rematch_votes(self, session: AsyncSession, game_id: int) -> None:
+        await dao.clear_rematch_votes(session, game_id)
 
     def make_rematch_keyboard(self, game_id: int) -> InlineKeyboardMarkup:
         return game_rematch_keyboard(game_id)

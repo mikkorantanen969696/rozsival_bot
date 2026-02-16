@@ -1,12 +1,14 @@
-﻿from __future__ import annotations
+from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
 
 from app.config import Config
 
 
-def validate_bet(amount: str, config: Config) -> tuple[bool, str | None, float | None]:
+def validate_bet(amount: str, config: Config) -> tuple[bool, str | None, Decimal | None]:
     try:
-        value = float(amount)
-    except ValueError:
+        value = Decimal(amount)
+    except (InvalidOperation, ValueError):
         return False, "Bet must be a number. 🔢", None
 
     if value < config.min_bet:

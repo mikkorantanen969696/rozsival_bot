@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -18,6 +18,8 @@ async def main() -> None:
     engine, session_factory = create_engine_and_session(config.database_url)
 
     if config.clear_db_on_start:
+        if config.app_env not in {"dev", "development", "local"}:
+            raise RuntimeError("CLEAR_DB_ON_START is allowed only when APP_ENV is dev/development/local")
         await clear_all_tables(engine)
 
     await init_db(engine)

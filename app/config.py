@@ -1,24 +1,26 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from pathlib import Path
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 from dotenv import load_dotenv
 
 
 @dataclass(frozen=True)
 class Config:
+    app_env: str
     database_url: str
     bot_token: str
     crypto_token: str
     admin_id: int
-    commission_percent: float
+    commission_percent: Decimal
     game_timeout_seconds: int
     max_active_games_per_user: int
-    min_bet: float
-    max_bet: float
-    min_withdraw: float
+    min_bet: Decimal
+    max_bet: Decimal
+    min_withdraw: Decimal
     clear_db_on_start: bool
 
 
@@ -57,6 +59,7 @@ def load_config() -> Config:
         default_db_url = "sqlite+aiosqlite:////data/gionta.db"
     database_url = os.getenv("DATABASE_URL", default_db_url).strip()
     database_url = _normalize_database_url(database_url)
+    app_env = os.getenv("APP_ENV", "production").strip().lower()
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     crypto_token = os.getenv("CRYPTO_TOKEN", "").strip()
 
@@ -64,18 +67,33 @@ def load_config() -> Config:
         raise RuntimeError("BOT_TOKEN and CRYPTO_TOKEN must be set")
 
     admin_id = int(os.getenv("ADMIN_ID", "0"))
-    commission_percent = float(os.getenv("COMMISSION_PERCENT", os.getenv("COMMISSION", "0")))
+    try:
+        commission_percent = Decimal(os.getenv("COMMISSION_PERCENT", os.getenv("COMMISSION", "0")).strip())
+        min_bet = Decimal(os.getenv("MIN_BET", "1").strip())
+        max_bet = Decimal(os.getenv("MAX_BET", "1000").strip())
+        min_withdraw = Decimal(os.getenv("MIN_WITHDRAW", "1").strip())
+    except (InvalidOperation, AttributeError):
+        raise RuntimeError("COMMISSION_PERCENT, MIN_BET, MAX_BET and MIN_WITHDRAW must be valid numbers")
+
     game_timeout_seconds = int(os.getenv("GAME_TIMEOUT_SECONDS", "30"))
     max_active_games_per_user = int(os.getenv("MAX_ACTIVE_GAMES_PER_USER", "1"))
-    min_bet = float(os.getenv("MIN_BET", "1"))
-    max_bet = float(os.getenv("MAX_BET", "1000"))
-    min_withdraw = float(os.getenv("MIN_WITHDRAW", "1"))
     clear_db_on_start = _get_bool(os.getenv("CLEAR_DB_ON_START"))
 
     if admin_id <= 0:
         raise RuntimeError("ADMIN_ID must be set to a positive integer")
+    if commission_percent < 0 or commission_percent > 100:
+        raise RuntimeError("COMMISSION_PERCENT must be between 0 and 100")
+    if min_bet <= 0 or max_bet <= 0 or min_bet > max_bet:
+        raise RuntimeError("MIN_BET and MAX_BET must be positive and MIN_BET <= MAX_BET")
+    if min_withdraw <= 0:
+        raise RuntimeError("MIN_WITHDRAW must be positive")
+    if game_timeout_seconds <= 0:
+        raise RuntimeError("GAME_TIMEOUT_SECONDS must be a positive integer")
+    if max_active_games_per_user <= 0:
+        raise RuntimeError("MAX_ACTIVE_GAMES_PER_USER must be a positive integer")
 
     return Config(
+        app_env=app_env,
         database_url=database_url,
         bot_token=bot_token,
         crypto_token=crypto_token,

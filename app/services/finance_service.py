@@ -1,8 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
-import logging
+from decimal import Decimal
 
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,24 +36,24 @@ class FinanceService:
     ):
         return await dao.get_or_create_user(session, user_id, username, referred_by=referred_by)
 
-    async def get_balance(self, session: AsyncSession, user_id: int) -> float:
+    async def get_balance(self, session: AsyncSession, user_id: int) -> Decimal:
         return await dao.get_user_balance(session, user_id)
 
-    async def add_balance(self, session: AsyncSession, user_id: int, amount: float) -> None:
+    async def add_balance(self, session: AsyncSession, user_id: int, amount: Decimal) -> None:
         await session.execute(update(User).where(User.id == user_id).values(balance=User.balance + amount))
         session.add(LedgerEntry(user_id=user_id, amount=amount, reason="deposit", game_id=None))
         await session.commit()
 
-    async def get_app_balance_usdt(self) -> float:
+    async def get_app_balance_usdt(self) -> Decimal:
         balances = await self._crypto.get_balance()
-        total = 0.0
+        total = Decimal("0")
         for b in balances or []:
             if getattr(b, "currency_code", "") == "USDT":
-                total += float(getattr(b, "available", 0) or 0)
-                total += float(getattr(b, "onhold", 0) or 0)
+                total += Decimal(str(getattr(b, "available", 0) or 0))
+                total += Decimal(str(getattr(b, "onhold", 0) or 0))
         return total
 
-    async def withdraw_to_cryptobot(self, session: AsyncSession, user_id: int, amount: float) -> tuple[bool, str | None]:
+    async def withdraw_to_cryptobot(self, session: AsyncSession, user_id: int, amount: Decimal) -> tuple[bool, str | None]:
         if amount < self._config.min_withdraw:
             return False, f"Minimum withdrawal is {self._config.min_withdraw:.2f} USDT."
         app_balance = await self.get_app_balance_usdt()
@@ -76,7 +77,7 @@ class FinanceService:
         spend_id = f"wd:{withdrawal.id}"
 
         try:
-            transfer = await self._crypto.transfer(user_id=user_id, amount=amount, asset="USDT", spend_id=spend_id)
+            transfer = await self._crypto.transfer(user_id=user_id, amount=float(amount), asset="USDT", spend_id=spend_id)
         except Exception as exc:
             self._logger.exception("withdraw transfer failed: user=%s amount=%s spend_id=%s", user_id, amount, spend_id)
             await session.execute(update(User).where(User.id == user_id).values(balance=User.balance + amount))
@@ -96,8 +97,8 @@ class FinanceService:
         await session.commit()
         return True, None
 
-    async def create_deposit(self, session: AsyncSession, user_id: int, amount: float) -> InvoiceResult:
-        invoice = await self._crypto.create_invoice(amount=amount, asset="USDT")
+    async def create_deposit(self, session: AsyncSession, user_id: int, amount: Decimal) -> InvoiceResult:
+        invoice = await self._crypto.create_invoice(amount=float(amount), asset="USDT")
         await dao.add_transaction(session, user_id, amount, invoice.invoice_id, TxStatus.pending)
         pay_url = (
             getattr(invoice, "pay_url", None)
@@ -127,7 +128,7 @@ class FinanceService:
             if mark_paid_result.rowcount != 1:
                 await session.rollback()
                 return False
-            amount = float(tx.amount)
+            amount = tx.amount
             await session.execute(update(User).where(User.id == tx.user_id).values(balance=User.balance + amount))
             session.add(LedgerEntry(user_id=tx.user_id, amount=amount, reason="deposit", game_id=None))
             await session.commit()
@@ -141,3 +142,6 @@ class FinanceService:
             )
             await session.commit()
         return False
+
+    async def close(self) -> None:
+        await self._crypto.close()

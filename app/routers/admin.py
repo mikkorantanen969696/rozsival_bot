@@ -1,6 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
@@ -170,7 +171,7 @@ async def admin_available(callback: CallbackQuery, session, config: Config, fina
     lang = await get_lang(session, callback.from_user.id)
     system_balance, _ = await dao.get_system_balance_and_users(session)
     app_balance = await finance.get_app_balance_usdt()
-    available = max(0.0, app_balance - system_balance)
+    available = max(Decimal("0"), app_balance - Decimal(str(system_balance)))
     if lang == "en":
         text = (
             f"App balance (CryptoBot): {app_balance:.2f} USDT 🏦\n"
@@ -322,8 +323,8 @@ async def admin_withdraw_refund(callback: CallbackQuery, session, config: Config
         )
         return
     await dao.set_withdrawal_status(session, withdrawal_id, WithdrawalStatus.refunded, datetime.utcnow())
-    await dao.update_user_balance(session, withdrawal.user_id, float(withdrawal.amount))
-    await dao.add_ledger_entry(session, withdrawal.user_id, float(withdrawal.amount), "withdraw_refund", None)
+    await dao.update_user_balance(session, withdrawal.user_id, withdrawal.amount)
+    await dao.add_ledger_entry(session, withdrawal.user_id, withdrawal.amount, "withdraw_refund", None)
     await callback.message.answer(
         f"Withdrawal #{withdrawal_id} refunded. ♻️" if lang == "en" else f"Вывод #{withdrawal_id} возвращен. ♻️"
     )

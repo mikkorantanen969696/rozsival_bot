@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from decimal import Decimal, InvalidOperation
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -23,9 +24,9 @@ router.message.filter(F.chat.type == "private")
 router.callback_query.filter(F.message.chat.type == "private")
 logger = logging.getLogger(__name__)
 
-_pending_custom_amount: set[int] = set()
-_pending_withdraw_amount: set[int] = set()
-_pending_withdraw_confirm: dict[int, float] = {}
+STATE_AWAIT_DEPOSIT = "await_deposit_amount"
+STATE_AWAIT_WITHDRAW = "await_withdraw_amount"
+STATE_CONFIRM_WITHDRAW = "await_withdraw_confirm"
 
 
 def _is_admin(user_id: int, config: Config) -> bool:
@@ -108,9 +109,7 @@ async def dm_withdraw(callback: CallbackQuery, session, finance: FinanceService,
         return
     lang = await get_lang(session, callback.from_user.id)
     balance = await finance.get_balance(session, callback.from_user.id)
-    _pending_withdraw_amount.add(callback.from_user.id)
-    _pending_custom_amount.discard(callback.from_user.id)
-    _pending_withdraw_confirm.pop(callback.from_user.id, None)
+    await dao.set_user_action_state(session, callback.from_user.id, STATE_AWAIT_WITHDRAW)
     if lang == EN:
         text = (
             f"Your balance: {balance:.2f} USDT 💰\n"
@@ -127,23 +126,23 @@ async def dm_withdraw(callback: CallbackQuery, session, finance: FinanceService,
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("dep:"))
+@router.callback_query(F.data.regexp(r"^dep:(custom|[0-9]+(?:\.[0-9]+)?)$"))
 async def dm_deposit_amount(callback: CallbackQuery, session, finance: FinanceService):
     if callback.message and callback.message.chat.type != "private":
         return
     lang = await get_lang(session, callback.from_user.id)
     _, value = callback.data.split(":", 1)
     if value == "custom":
-        _pending_custom_amount.add(callback.from_user.id)
+        await dao.set_user_action_state(session, callback.from_user.id, STATE_AWAIT_DEPOSIT)
         await callback.message.answer(
             "Enter a deposit amount (USDT) 💬:" if lang == EN else "Введите сумму пополнения (USDT) 💬:"
         )
         await callback.answer()
         return
 
-    amount = float(value)
+    amount = Decimal(value)
     if amount <= 0:
-        await callback.message.answer("Invalid amount. ❗" if lang == EN else "Некорректная сумма. ❗")
+        await callback.message.answer("Invalid amount. ❌" if lang == EN else "Некорректная сумма. ❌")
         await callback.answer()
         return
 
@@ -161,13 +160,14 @@ async def dm_deposit_amount(callback: CallbackQuery, session, finance: FinanceSe
 async def dm_custom_amount(message: Message, session, finance: FinanceService):
     if message.chat.type != "private" or message.from_user is None:
         return
-    if message.from_user.id not in _pending_custom_amount and message.from_user.id not in _pending_withdraw_amount:
+    state = await dao.get_user_action_state(session, message.from_user.id)
+    if state is None:
         return
     lang = await get_lang(session, message.from_user.id)
     try:
         raw = (message.text or "0").strip().replace(",", ".")
-        amount = float(raw)
-    except ValueError:
+        amount = Decimal(raw)
+    except (InvalidOperation, ValueError):
         await message.answer("Enter a number. 🔢" if lang == EN else "Введите число. 🔢")
         return
 
@@ -175,8 +175,8 @@ async def dm_custom_amount(message: Message, session, finance: FinanceService):
         await message.answer("Amount must be greater than 0. 📈" if lang == EN else "Сумма должна быть больше 0. 📈")
         return
 
-    if message.from_user.id in _pending_custom_amount:
-        _pending_custom_amount.discard(message.from_user.id)
+    if state.action == STATE_AWAIT_DEPOSIT:
+        await dao.clear_user_action_state(session, message.from_user.id)
         invoice = await finance.create_deposit(session, message.from_user.id, amount)
         text = (
             f"Invoice created for {amount} USDT. Pay using the button below 💳"
@@ -186,13 +186,18 @@ async def dm_custom_amount(message: Message, session, finance: FinanceService):
         await message.answer(text, reply_markup=invoice_keyboard(invoice.invoice_id, invoice.pay_url, lang))
         return
 
-    _pending_withdraw_amount.discard(message.from_user.id)
-    balance = await finance.get_balance(session, message.from_user.id)
-    if amount > balance:
-        await message.answer("Insufficient balance for withdrawal. 💸" if lang == EN else "Недостаточно средств для вывода. 💸")
+    if state.action != STATE_AWAIT_WITHDRAW:
         return
 
-    _pending_withdraw_confirm[message.from_user.id] = amount
+    await dao.clear_user_action_state(session, message.from_user.id)
+    balance = await finance.get_balance(session, message.from_user.id)
+    if amount > balance:
+        await message.answer(
+            "Insufficient balance for withdrawal. 💸" if lang == EN else "Недостаточно средств для вывода. 💸"
+        )
+        return
+
+    await dao.set_user_action_state(session, message.from_user.id, STATE_CONFIRM_WITHDRAW, amount=amount)
     text = (
         f"Withdraw {amount:.2f} USDT to your CryptoBot account? 💸"
         if lang == EN
@@ -206,11 +211,13 @@ async def dm_withdraw_confirm(callback: CallbackQuery, session, finance: Finance
     if callback.message and callback.message.chat.type != "private":
         return
     lang = await get_lang(session, callback.from_user.id)
-    amount = _pending_withdraw_confirm.pop(callback.from_user.id, None)
-    if amount is None:
+    state = await dao.get_user_action_state(session, callback.from_user.id)
+    if state is None or state.action != STATE_CONFIRM_WITHDRAW or state.amount is None:
         await callback.answer("No pending withdrawal. 📭" if lang == EN else "Нет ожидающего вывода. 📭")
         return
 
+    amount = state.amount
+    await dao.clear_user_action_state(session, callback.from_user.id)
     ok, error = await finance.withdraw_to_cryptobot(session, callback.from_user.id, amount)
     if ok:
         await callback.message.answer(
@@ -228,7 +235,7 @@ async def dm_withdraw_cancel(callback: CallbackQuery, session):
     if callback.message and callback.message.chat.type != "private":
         return
     lang = await get_lang(session, callback.from_user.id)
-    _pending_withdraw_confirm.pop(callback.from_user.id, None)
+    await dao.clear_user_action_state(session, callback.from_user.id)
     await callback.message.answer("Withdrawal canceled. ❌" if lang == EN else "Вывод отменен. ❌")
     await callback.answer()
 

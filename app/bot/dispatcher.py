@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -36,5 +36,11 @@ def create_dispatcher(config: Config, session_factory):
     dp.include_router(admin_router)
 
     game_service.start_timeout_watcher(bot)
+
+    async def on_shutdown(bot: Bot) -> None:
+        await game_service.stop_timeout_watcher()
+        await finance.close()
+
+    dp.shutdown.register(on_shutdown)
 
     return dp, bot

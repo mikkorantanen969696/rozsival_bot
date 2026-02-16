@@ -1,7 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta
+from decimal import Decimal
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -104,7 +106,7 @@ async def _handle_game_command(message: Message, command: CommandObject, session
             )
         return
 
-    games.create_draft(message.from_user.id, username, opponent_id)
+    await games.create_draft(session, message.from_user.id, username, opponent_id)
     await message.answer("Choose a game type 🎮:", reply_markup=draft_type_keyboard())
 
 
@@ -126,7 +128,7 @@ async def draft_update(callback: CallbackQuery, session, games: GameService, con
     if not callback.from_user:
         return
 
-    draft = games.get_draft(callback.from_user.id)
+    draft = await games.get_draft(session, callback.from_user.id)
     if not draft:
         await callback.answer("Draft not found. 📝")
         return
@@ -137,16 +139,19 @@ async def draft_update(callback: CallbackQuery, session, games: GameService, con
 
     if action == "type":
         draft.game_type = GameType(value)
+        await games.save_draft(session, callback.from_user.id, draft)
         await callback.message.answer("Type selected. Choose rounds 🎯:", reply_markup=draft_rounds_keyboard())
     elif action == "rounds":
         rounds_value = int(value)
         draft.rounds_to_win = rounds_value
+        await games.save_draft(session, callback.from_user.id, draft)
         if draft.game_type == GameType.paid:
             await callback.message.answer("Choose a bet 💵:", reply_markup=draft_bet_keyboard())
         else:
             await callback.message.answer("Ready. Send challenge? 🚀", reply_markup=draft_confirm_keyboard())
     elif action == "bet":
-        draft.bet = float(value)
+        draft.bet = Decimal(value)
+        await games.save_draft(session, callback.from_user.id, draft)
         await callback.message.answer("Ready. Send challenge? 🚀", reply_markup=draft_confirm_keyboard())
     elif action == "send":
         if not draft.is_ready():
@@ -178,13 +183,13 @@ async def draft_update(callback: CallbackQuery, session, games: GameService, con
                     "Ask them to open DM with the bot and send /start, "
                     "or challenge them by replying to their message. 🧭"
                 )
-                games.clear_draft(callback.from_user.id)
+                await games.clear_draft(session, callback.from_user.id)
                 await callback.answer()
                 return
 
         if opponent_chat.id == callback.from_user.id:
             await callback.message.answer("You can't play with yourself. 🙅")
-            games.clear_draft(callback.from_user.id)
+            await games.clear_draft(session, callback.from_user.id)
             await callback.answer()
             return
 
@@ -194,7 +199,7 @@ async def draft_update(callback: CallbackQuery, session, games: GameService, con
         can_start_opponent = await games.can_start_game(session, opponent_chat.id)
         if not can_start_opponent:
             await callback.message.answer("Your opponent already has an active game. ⛔")
-            games.clear_draft(callback.from_user.id)
+            await games.clear_draft(session, callback.from_user.id)
             await callback.answer()
             return
 
@@ -205,7 +210,7 @@ async def draft_update(callback: CallbackQuery, session, games: GameService, con
             player2_id=opponent_chat.id,
             draft=draft,
         )
-        games.clear_draft(callback.from_user.id)
+        await games.clear_draft(session, callback.from_user.id)
         opponent_name = opponent_chat.username or opponent_chat.full_name or "player"
         opponent_mention = f"<a href=\"tg://user?id={opponent_chat.id}\">{opponent_name}</a>"
         initiator = _format_user(callback.from_user)
@@ -215,7 +220,7 @@ async def draft_update(callback: CallbackQuery, session, games: GameService, con
             reply_markup=challenge_keyboard(game.id),
         )
     elif action == "cancel":
-        games.clear_draft(callback.from_user.id)
+        await games.clear_draft(session, callback.from_user.id)
         await callback.message.answer("Draft canceled. 🧹")
 
     await callback.answer()
@@ -247,10 +252,36 @@ async def game_accept(callback: CallbackQuery, session, games: GameService, conf
         await callback.answer()
         return
 
+    activate_stmt = (
+        update(Game)
+        .where(Game.id == game.id, Game.status == GameStatus.pending)
+        .values(
+            status=GameStatus.active,
+            current_turn_user_id=game.player1_id,
+            turn_deadline=datetime.utcnow() + timedelta(seconds=config.game_timeout_seconds),
+        )
+    )
+    activate_result = await session.execute(activate_stmt)
+    if activate_result.rowcount != 1:
+        await session.rollback()
+        await callback.answer("Game is already processed. ❗")
+        return
+
     if game.type == GameType.paid:
-        p1_balance = await dao.get_user_balance(session, game.player1_id)
-        p2_balance = await dao.get_user_balance(session, game.player2_id)
-        if p1_balance < game.bet or p2_balance < game.bet:
+        lock_p1 = await session.execute(
+            update(User)
+            .where(User.id == game.player1_id, User.balance >= game.bet)
+            .values(balance=User.balance - game.bet)
+        )
+        lock_p2 = await session.execute(
+            update(User)
+            .where(User.id == game.player2_id, User.balance >= game.bet)
+            .values(balance=User.balance - game.bet)
+        )
+        if lock_p1.rowcount != 1 or lock_p2.rowcount != 1:
+            await session.rollback()
+            p1_balance = await dao.get_user_balance(session, game.player1_id)
+            p2_balance = await dao.get_user_balance(session, game.player2_id)
             await callback.message.answer("Insufficient funds. Check DM. 💸")
             if p1_balance < game.bet:
                 need = game.bet - p1_balance
@@ -267,14 +298,11 @@ async def game_accept(callback: CallbackQuery, session, games: GameService, conf
             await callback.answer()
             return
 
-        await session.execute(update(User).where(User.id == game.player1_id).values(balance=User.balance - game.bet))
-        await session.execute(update(User).where(User.id == game.player2_id).values(balance=User.balance - game.bet))
-        session.add(LedgerEntry(user_id=game.player1_id, amount=-float(game.bet), reason="bet_lock", game_id=game.id))
-        session.add(LedgerEntry(user_id=game.player2_id, amount=-float(game.bet), reason="bet_lock", game_id=game.id))
+        session.add(LedgerEntry(user_id=game.player1_id, amount=-game.bet, reason="bet_lock", game_id=game.id))
+        session.add(LedgerEntry(user_id=game.player2_id, amount=-game.bet, reason="bet_lock", game_id=game.id))
         game.funds_locked = True
-        await session.commit()
 
-    await games.start_game(session, game)
+    await session.commit()
     await callback.message.answer(
         f"Game started! <a href=\"tg://user?id={game.player1_id}\">Player</a> to move. 🎲"
     )
@@ -285,8 +313,11 @@ async def game_accept(callback: CallbackQuery, session, games: GameService, conf
 async def game_decline(callback: CallbackQuery, session):
     game_id = int(callback.data.split(":")[-1])
     game = await session.get(Game, game_id)
-    if not game:
+    if not game or game.status != GameStatus.pending:
         await callback.answer()
+        return
+    if callback.from_user.id != game.player2_id:
+        await callback.answer("You are not invited to this game. 🚫")
         return
 
     game.status = GameStatus.cancelled
@@ -396,12 +427,12 @@ async def game_rematch(callback: CallbackQuery, session, games: GameService):
         await callback.answer("You are not a participant in this game. 🚫")
         return
 
-    votes = games.add_rematch_vote(game_id, callback.from_user.id)
+    votes = await games.add_rematch_vote(session, game_id, callback.from_user.id)
     if votes < 2:
         await callback.answer("Waiting for the second player. ⏳")
         return
 
-    games.clear_rematch_votes(game_id)
+    await games.clear_rematch_votes(session, game_id)
     new_game = await games.rematch(session, game)
     await callback.message.answer(
         "Rematch! Tap accept 🔁:",

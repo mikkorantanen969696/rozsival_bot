@@ -1,17 +1,23 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
+
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
     CommissionEntry,
     Game,
+    GameDraft,
     GameStatus,
     GameType,
     LedgerEntry,
+    RematchVote,
     Transaction,
     TxStatus,
+    UserActionState,
     User,
     Withdrawal,
     WithdrawalStatus,
@@ -67,7 +73,7 @@ async def create_game(
     player1_id: int,
     player2_id: int,
     game_type: GameType,
-    bet: int,
+    bet: Decimal,
     rounds_to_win: int,
 ) -> Game:
     game = Game(
@@ -94,7 +100,7 @@ async def set_game_status(session: AsyncSession, game_id: int, status: GameStatu
 async def add_transaction(
     session: AsyncSession,
     user_id: int,
-    amount: float,
+    amount: Decimal,
     invoice_id: int | None,
     status: TxStatus,
 ) -> Transaction:
@@ -123,16 +129,16 @@ async def set_tx_status(session: AsyncSession, tx_id: int, status: TxStatus) -> 
     await session.commit()
 
 
-async def update_user_balance(session: AsyncSession, user_id: int, delta: float) -> None:
+async def update_user_balance(session: AsyncSession, user_id: int, delta: Decimal) -> None:
     stmt = update(User).where(User.id == user_id).values(balance=User.balance + delta)
     await session.execute(stmt)
     await session.commit()
 
 
-async def get_user_balance(session: AsyncSession, user_id: int) -> float:
+async def get_user_balance(session: AsyncSession, user_id: int) -> Decimal:
     stmt = select(User.balance).where(User.id == user_id)
     result = await session.execute(stmt)
-    return float(result.scalar_one_or_none() or 0)
+    return result.scalar_one_or_none() or Decimal("0")
 
 
 async def get_avg_bet(session: AsyncSession) -> float:
@@ -162,7 +168,7 @@ async def get_system_balance_and_users(session: AsyncSession) -> tuple[float, in
 async def add_ledger_entry(
     session: AsyncSession,
     user_id: int,
-    amount: float,
+    amount: Decimal,
     reason: str,
     game_id: int | None = None,
 ) -> LedgerEntry:
@@ -179,7 +185,7 @@ async def get_recent_ledger(session: AsyncSession, limit: int = 20) -> list[Ledg
     return list(result.scalars().all())
 
 
-async def add_commission_entry(session: AsyncSession, user_id: int, game_id: int, amount: float) -> CommissionEntry:
+async def add_commission_entry(session: AsyncSession, user_id: int, game_id: int, amount: Decimal) -> CommissionEntry:
     entry = CommissionEntry(user_id=user_id, game_id=game_id, amount=amount)
     session.add(entry)
     await session.commit()
@@ -187,7 +193,7 @@ async def add_commission_entry(session: AsyncSession, user_id: int, game_id: int
     return entry
 
 
-async def create_withdrawal(session: AsyncSession, user_id: int, amount: float) -> Withdrawal:
+async def create_withdrawal(session: AsyncSession, user_id: int, amount: Decimal) -> Withdrawal:
     withdrawal = Withdrawal(user_id=user_id, amount=amount, status=WithdrawalStatus.pending)
     session.add(withdrawal)
     await session.commit()
@@ -313,3 +319,90 @@ async def get_referral_structure(session: AsyncSession) -> list[tuple[int, str |
         )
         for row in result.all()
     ]
+
+
+async def upsert_game_draft(
+    session: AsyncSession,
+    user_id: int,
+    opponent_username: str | None,
+    opponent_id: int | None,
+    game_type: GameType | None = None,
+    bet: Decimal | None = None,
+    rounds_to_win: int | None = None,
+) -> None:
+    draft = await session.get(GameDraft, user_id)
+    if draft is None:
+        draft = GameDraft(
+            user_id=user_id,
+            opponent_username=opponent_username,
+            opponent_id=opponent_id,
+            game_type=game_type,
+            bet=bet,
+            rounds_to_win=rounds_to_win,
+        )
+        session.add(draft)
+    else:
+        draft.opponent_username = opponent_username
+        draft.opponent_id = opponent_id
+        draft.game_type = game_type
+        draft.bet = bet
+        draft.rounds_to_win = rounds_to_win
+    await session.commit()
+
+
+async def get_game_draft(session: AsyncSession, user_id: int) -> GameDraft | None:
+    return await session.get(GameDraft, user_id)
+
+
+async def delete_game_draft(session: AsyncSession, user_id: int) -> None:
+    draft = await session.get(GameDraft, user_id)
+    if draft is None:
+        return
+    await session.delete(draft)
+    await session.commit()
+
+
+async def add_rematch_vote(session: AsyncSession, game_id: int, user_id: int) -> int:
+    vote = RematchVote(game_id=game_id, user_id=user_id)
+    session.add(vote)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+    stmt = select(func.count(RematchVote.id)).where(RematchVote.game_id == game_id)
+    result = await session.execute(stmt)
+    return int(result.scalar_one_or_none() or 0)
+
+
+async def clear_rematch_votes(session: AsyncSession, game_id: int) -> None:
+    stmt = RematchVote.__table__.delete().where(RematchVote.game_id == game_id)
+    await session.execute(stmt)
+    await session.commit()
+
+
+async def set_user_action_state(
+    session: AsyncSession,
+    user_id: int,
+    action: str,
+    amount: Decimal | None = None,
+) -> None:
+    state = await session.get(UserActionState, user_id)
+    if state is None:
+        state = UserActionState(user_id=user_id, action=action, amount=amount)
+        session.add(state)
+    else:
+        state.action = action
+        state.amount = amount
+    await session.commit()
+
+
+async def get_user_action_state(session: AsyncSession, user_id: int) -> UserActionState | None:
+    return await session.get(UserActionState, user_id)
+
+
+async def clear_user_action_state(session: AsyncSession, user_id: int) -> None:
+    state = await session.get(UserActionState, user_id)
+    if state is None:
+        return
+    await session.delete(state)
+    await session.commit()

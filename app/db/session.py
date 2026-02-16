@@ -33,6 +33,9 @@ async def clear_all_tables(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         dialect = conn.engine.dialect.name
         if dialect == "sqlite":
+            await conn.execute(text("DELETE FROM user_action_states"))
+            await conn.execute(text("DELETE FROM rematch_votes"))
+            await conn.execute(text("DELETE FROM game_drafts"))
             await conn.execute(text("DELETE FROM commission_entries"))
             await conn.execute(text("DELETE FROM withdrawals"))
             await conn.execute(text("DELETE FROM ledger"))
@@ -42,7 +45,7 @@ async def clear_all_tables(engine: AsyncEngine) -> None:
         else:
             await conn.execute(
                 text(
-                    "TRUNCATE TABLE commission_entries, withdrawals, ledger, games, transactions, users "
+                    "TRUNCATE TABLE user_action_states, rematch_votes, game_drafts, commission_entries, withdrawals, ledger, games, transactions, users "
                     "RESTART IDENTITY CASCADE"
                 )
             )
